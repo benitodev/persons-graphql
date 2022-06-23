@@ -1,31 +1,17 @@
-import { ApolloServer, UserInputError, gql } from "apollo-server";
-import { v1 as uuid } from "uuid";
+import {
+  ApolloServer,
+  UserInputError,
+  gql,
+  AuthenticationError,
+} from "apollo-server";
+import "./db.js";
+import Person from "./models/Person.js";
+import User from "./models/user.js";
+import jwt from "jsonwebtoken";
 import axios from "axios";
-const persons = [
-  {
-    age: "23",
-    name: "benitoka",
-    phone: "000-111233",
-    id: 1,
-    city: "Cordoba",
-    street: "argandoña",
-  },
-  {
-    age: "3",
-    name: "pipon",
-    phone: "222-111233",
-    id: 2,
-    city: "La Rioja",
-    street: "w kiowa st",
-  },
-  {
-    age: "2",
-    name: "plum",
-    id: 3,
-    city: "Buenos aires",
-    street: "colorado ave",
-  },
-];
+
+const SECRET_KEY = "adwad9239244@@@#~|#€adwadaw";
+
 const typeDefs = gql`
   enum YesNo {
     YES
@@ -36,18 +22,27 @@ const typeDefs = gql`
     city: String!
   }
   type Person {
-    age: String!
     name: String!
     phone: String
-    adress: Address!
+    address: Address!
     id: ID!
     check: Boolean
   }
 
+  type User {
+    id: ID!
+    username: String!
+    friends: [Person!]!
+  }
+
+  type Token {
+    value: String!
+  }
   type Query {
     personCount: Int!
     allPersons(phone: YesNo): [Person]!
     findPerson(name: String!): Person
+    me: User
   }
 
   type Mutation {
@@ -58,53 +53,109 @@ const typeDefs = gql`
       city: String!
     ): Person
     editNumber(name: String!, phone: String!): Person
+    createUser(username: String!): User
+    login(username: String!, password: String!): Token
+    addAsFriend(name: String!): User
   }
 `;
 
 const resolvers = {
   Mutation: {
-    addPerson: (root, args) => {
-      if (persons.find((p) => p.name === args.name)) {
-        throw new UserInputError("Name must be unique", {
-          invalidArgs: args.name,
+    addPerson: async (root, args, context) => {
+      const { currentUser } = context;
+      if (!currentUser) throw new AuthenticationError("not authenticated");
+      const person = new Person({ ...args, street: args.street });
+      console.log(person);
+      try {
+        await person.save();
+      } catch (error) {
+        throw new UserInputError(error.message, {
+          invalidArgs: args,
         });
       }
-      const person = { ...args, id: uuid() };
-      persons.push(person);
       return person;
     },
-    editNumber: (root, args) => {
-      const personIndex = persons.findIndex((p) => p.name === args.name);
-      if (personIndex === -1) return null;
-      const person = persons[personIndex];
-      const updatePerson = { ...person, phone: args.phone };
-      persons[personIndex] = updatePerson;
-      return updatePerson;
+    editNumber: async (root, args) => {
+      const person = await Person.findOne({ name: args.name });
+      if (!person) return;
+      person.phone = args.phone;
+      try {
+        await person.save();
+      } catch (error) {
+        throw new UserInputError(error.message, {
+          invalidArgs: args,
+        });
+      }
+      return person;
+    },
+    createUser: async (root, args) => {
+      const user = new User({ username: args.username });
+      //another way to handle the errors. Not always of course
+      return user.save().catch((error) => {
+        throw new UserInputError(error.message, {
+          invalidArgs: args,
+        });
+      });
+    },
+    login: async (root, args) => {
+      const user = await User.findOne({ username: args.username });
+      if (!user || args.password !== "secret") {
+        throw new UserInputError("wrong credentials", {
+          invalidArgs: args,
+        });
+      }
+      const userForToken = {
+        username: user.username,
+        id: user._id,
+      };
+
+      return {
+        value: jwt.sign(userForToken, SECRET_KEY),
+      };
+    },
+    addAsFriend: async (root, args, context) => {
+      const { currentUser } = context;
+      if (!currentUser) throw new AuthenticationError("not authenticated");
+      const nonFriendlyAlready = (person) => {
+        return !currentUser.friends
+          .map((p) => p._id.toString())
+          .includes(person._id.toString());
+      };
+      const person = await Person.findOne({ name: args.name });
+
+      if (nonFriendlyAlready(person)) {
+        currentUser.friends = currentUser.friends.concat(person);
+        await currentUser.save();
+      }
+
+      return currentUser;
     },
   },
   Query: {
-    personCount: () => persons.length,
+    personCount: () => Person.collection.countDocuments(),
     allPersons: async (root, args) => {
-      const { data: personsFromRestApi } = await axios.get(
-        "http://localhost:3001/persons"
-      );
-      if (!args.phone) return personsFromRestApi;
+      if (!args.phone) {
+        return Person.find({});
+      }
 
-      const byPhone = (person) =>
-        args.phone === "YES" ? person.phone : !person.phone;
-      return personsFromRestApi.filter(byPhone);
+      return Person.find({ phone: { $exists: args.phone === "YES" } });
     },
 
-    findPerson: (root, args) => {
-      const { name } = args;
-      return persons.find((person) => person.name === name);
+    findPerson: async (root, args) => {
+      const person = await Person.findOne({ name: args.name });
+      console.log(person);
+      return person;
+    },
+
+    me: (root, args, context) => {
+      return context.currentUser;
     },
   },
   Person: {
-    adress: (root) => {
+    address: (root) => {
       return {
         city: root.city,
-        street: root.name,
+        street: root.street,
       };
     },
     check: () => true,
@@ -114,8 +165,18 @@ const resolvers = {
 const server = new ApolloServer({
   typeDefs,
   resolvers,
-  csrfPrevention: true,
-  cache: "bounded",
+  context: async ({ req }) => {
+    const auth = req ? req.headers.authorization : null;
+    if (auth && auth.toLowerCase().startsWith("bearer ")) {
+      const token = auth.substring(7);
+      const decodedToken = jwt.verify(token, SECRET_KEY);
+      const currentUser = await User.findById(decodedToken.id).populate(
+        "friends"
+      );
+      return { currentUser };
+    }
+    return null;
+  },
 });
 
 server.listen().then(({ url }) => {
