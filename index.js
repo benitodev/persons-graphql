@@ -4,6 +4,7 @@ import {
   gql,
   AuthenticationError,
 } from "apollo-server";
+import "dotenv/config";
 import "./db.js";
 import Person from "./models/Person.js";
 import User from "./models/user.js";
