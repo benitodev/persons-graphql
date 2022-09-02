@@ -7,7 +7,12 @@ const userSchema = mongoose.Schema({
     unique: true,
     minlength: 3,
   },
-  friends: [{ ref: "Person", type: mongoose.Schema.Types.ObjectId }],
+  friendOf: [
+    {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    }
+  ], 
 });
 
 const User = mongoose.model("User", userSchema);
